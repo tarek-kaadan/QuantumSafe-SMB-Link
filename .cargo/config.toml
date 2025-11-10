@@ -1,0 +1,6 @@
+﻿[build]
+# Faster local builds; feel free to tweak
+rustflags = ["-Ctarget-cpu=native"]
+
+[target.x86_64-pc-windows-msvc]
+# Keep default MSVC linker; nothing special needed for pure-Rust PQ crates
