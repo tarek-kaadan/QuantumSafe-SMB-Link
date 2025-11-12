@@ -1,8 +1,21 @@
-pub fn split_frame(mut raw: &[u8]) -> Option<(usize,[u8;12],Vec<u8>)> {
-    if raw.len() < 4+12 { return None; }
-    let len = u32::from_le_bytes(raw[0..4].try_into().ok()?) as usize;
-    let mut nonce = [0u8;12];
-    nonce.copy_from_slice(&raw[4..16]);
-    let ct = raw[16..16+len].to_vec();
-    Some((len, nonce, ct))
+// src/frame.rs
+use anyhow::{Result, bail};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub async fn write_frame<W: AsyncWriteExt + Unpin>(mut w: W, nonce: u64, ct: &[u8]) -> Result<()> {
+    let len: u32 = (8 + ct.len()) as u32; // 8 for u64 nonce
+    w.write_u32_le(len).await?;
+    w.write_u64_le(nonce).await?;
+    w.write_all(ct).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+pub async fn read_frame<R: AsyncReadExt + Unpin>(mut r: R) -> Result<(u64, Vec<u8>)> {
+    let len = r.read_u32_le().await?;
+    if len < 8 { bail!("frame too short"); }
+    let nonce = r.read_u64_le().await?;
+    let mut buf = vec![0u8; (len - 8) as usize];
+    r.read_exact(&mut buf).await?;
+    Ok((nonce, buf))
 }

@@ -1,39 +1,52 @@
-use anyhow::{Result, bail};
-use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::aead::NewAead;
+// src/aead.rs
+use anyhow::{anyhow, Result};
+use chacha20poly1305::{
+    aead::{Aead, Payload},
+    ChaCha20Poly1305, KeyInit, Nonce,
+};
+use hkdf::Hkdf;
+use sha2::Sha256;
 
-pub struct AeadState {
-    aead: ChaCha20Poly1305,
-    nonce: u64,
+#[derive(Clone)]
+pub struct SessionKeys {
+    pub tx: [u8; 32],
+    pub rx: [u8; 32],
 }
 
-impl AeadState {
-    pub fn new(key: &[u8]) -> Self {
-        Self { aead: ChaCha20Poly1305::new(Key::from_slice(key)), nonce: 0 }
+impl SessionKeys {
+    pub fn derive(preauth: &[u8], ikm: &[u8]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(preauth), ikm);
+        let mut tx = [0u8; 32];
+        let mut rx = [0u8; 32];
+        hk.expand(b"pq-smb tx v1", &mut tx).unwrap();
+        hk.expand(b"pq-smb rx v1", &mut rx).unwrap();
+        Self { tx, rx }
     }
-    fn next_nonce(&mut self) -> [u8;12] {
-        let n = self.nonce;
-        self.nonce = self.nonce.checked_add(1).expect("nonce overflow");
-        let mut out = [0u8;12];
-        out[4..12].copy_from_slice(&n.to_le_bytes());
-        out
+}
+
+#[derive(Default, Clone)]
+pub struct NonceCounter(u64);
+
+impl NonceCounter {
+    pub fn next(&mut self) -> u64 {
+        let n = self.0;
+        self.0 = self.0.checked_add(1).expect("nonce overflow");
+        n
     }
-    pub fn seal(&mut self, buf: &mut Vec<u8>) -> Result<Vec<u8>> {
-        let n = self.next_nonce();
-        let mut ct = buf.clone();
-        self.aead.encrypt_in_place(Nonce::from_slice(&n), b"", &mut ct)
-            .map_err(|_| anyhow::anyhow!("seal"))?;
-        // frame: len | nonce | ct
-        let mut out = Vec::with_capacity(4 + 12 + ct.len());
-        out.extend_from_slice(&(ct.len() as u32).to_le_bytes());
-        out.extend_from_slice(&n);
-        out.extend_from_slice(&ct);
-        Ok(out)
-    }
-    pub fn open(&self, nonce: [u8;12], mut ct: Vec<u8>) -> Result<Vec<u8>> {
-        let mut data = ct.clone();
-        self.aead.decrypt_in_place(Nonce::from_slice(&nonce), b"", &mut data)
-            .map_err(|_| anyhow::anyhow!("open"))?;
-        Ok(data)
-    }
+}
+
+pub fn aead_seal(key: &[u8; 32], nonce12: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow!("invalid key length"))?;
+    let nonce = Nonce::from(*nonce12);
+    cipher
+        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .map_err(|_| anyhow!("aead encrypt failed"))
+}
+
+pub fn aead_open(key: &[u8; 32], nonce12: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow!("invalid key length"))?;
+    let nonce = Nonce::from(*nonce12);
+    cipher
+        .decrypt(&nonce, Payload { msg: ciphertext, aad })
+        .map_err(|_| anyhow!("aead decrypt failed"))
 }
