@@ -4,13 +4,12 @@ use pqcrypto_traits::sign::{
     DetachedSignature as _, PublicKey as _, SecretKey as _,
 };
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn generate_keys() -> (Vec<u8>, Vec<u8>) {
     let (pk, sk) = dilithium2::keypair();
     (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
 }
 
-#[allow(dead_code)]
 pub fn sign_detached(msg: &[u8], sk_bytes: &[u8]) -> Result<Vec<u8>> {
     let sk = dilithium2::SecretKey::from_bytes(sk_bytes)
         .map_err(|e| anyhow!("invalid Dilithium secret key: {:?}", e))?;
@@ -19,7 +18,6 @@ pub fn sign_detached(msg: &[u8], sk_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(sig.as_bytes().to_vec())
 }
 
-#[allow(dead_code)]
 pub fn verify_detached(msg: &[u8], sig_bytes: &[u8], pk_bytes: &[u8]) -> Result<()> {
     let pk = dilithium2::PublicKey::from_bytes(pk_bytes)
         .map_err(|e| anyhow!("invalid Dilithium public key: {:?}", e))?;

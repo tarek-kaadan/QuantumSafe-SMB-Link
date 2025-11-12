@@ -13,6 +13,12 @@ pub struct SessionKeys {
     pub rx: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRole {
+    Client,
+    Server,
+}
+
 impl SessionKeys {
     pub fn derive(preauth: &[u8], ikm: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(preauth), ikm);
@@ -21,6 +27,20 @@ impl SessionKeys {
         hk.expand(b"pq-smb tx v1", &mut tx).unwrap();
         hk.expand(b"pq-smb rx v1", &mut rx).unwrap();
         Self { tx, rx }
+    }
+
+    pub fn derive_for_role(preauth: &[u8], ikm: &[u8], role: SessionRole) -> Self {
+        let mut keys = Self::derive(preauth, ikm);
+        if matches!(role, SessionRole::Server) {
+            keys.swap_directions();
+        }
+        keys
+    }
+
+    fn swap_directions(&mut self) {
+        let tx = self.tx;
+        self.tx = self.rx;
+        self.rx = tx;
     }
 }
 

@@ -22,11 +22,11 @@ anyhow = "1"
 rand_core = "0.6"
 tokio = { version = "1.48.0", features = ["full"] }
 bytes = "1.10.1"
-bincode = { version = "2.0.1", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
 thiserror = "2.0.17"
 serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [build-dependencies]
 cc = "1"
-

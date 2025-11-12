@@ -3,13 +3,15 @@ mod aead;
 mod frame;
 mod net;
 mod kem;
-mod sig; // adjust to your filenames
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-const HYBRID_MODE: bool = true;
+mod sig;
+
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+use std::{fs, path::PathBuf, sync::Arc};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
+#[command(name = "QuantumSafe-SMB-Link", version, about = "Post-quantum SMB tunnel")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -17,58 +19,86 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Server { listen: String, forward: String, /* keys etc. */ },
-    Client { listen: String, dial: String, /* keys etc. */ },
+    Server(ServerCli),
+    Client(ClientCli),
+}
+
+#[derive(Args)]
+struct ServerCli {
+    #[arg(long, default_value = "0.0.0.0:7445")]
+    listen: String,
+    #[arg(long, default_value = "127.0.0.1:445")]
+    forward: String,
+    #[arg(long)]
+    server_sk: PathBuf,
+    #[arg(long)]
+    client_pk: PathBuf,
+    #[arg(long, default_value_t = true)]
+    hybrid: bool,
+    #[arg(long, default_value_t = true)]
+    pq_required: bool,
+}
+
+#[derive(Args)]
+struct ClientCli {
+    #[arg(long, default_value = "127.0.0.1:1445")]
+    listen: String,
+    #[arg(long, default_value = "127.0.0.1:7445")]
+    dial: String,
+    #[arg(long)]
+    client_sk: PathBuf,
+    #[arg(long)]
+    server_pk: PathBuf,
+    #[arg(long, default_value_t = true)]
+    hybrid: bool,
+    #[arg(long, default_value_t = true)]
+    pq_required: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Server { listen, forward } => net::run_server(&listen, &forward).await?,
-        Cmd::Client { listen, dial }    => net::run_client(&listen, &dial).await?,
+        Cmd::Server(args) => {
+            let config = net::ServerConfig {
+                listen: args.listen,
+                forward: args.forward,
+                crypto: net::ServerCryptoConfig {
+                    server_secret: load_key(&args.server_sk)?,
+                    client_public: load_key(&args.client_pk)?,
+                    hybrid: args.hybrid,
+                    pq_required: args.pq_required,
+                },
+            };
+            net::run_server(config).await?;
+        }
+        Cmd::Client(args) => {
+            let config = net::ClientConfig {
+                listen: args.listen,
+                dial: args.dial,
+                crypto: net::ClientCryptoConfig {
+                    client_secret: load_key(&args.client_sk)?,
+                    server_public: load_key(&args.server_pk)?,
+                    hybrid: args.hybrid,
+                    pq_required: args.pq_required,
+                },
+            };
+            net::run_client(config).await?;
+        }
     }
     Ok(())
 }
 
-/// Called by net.rs during handshake
-pub async fn main_handshake_client(stream: &mut tokio::net::TcpStream) -> Result<(aead::SessionKeys, Vec<u8>)> {
-    let (client_hello, client_state) = crate::kem::client_make_hello(HYBRID_MODE)?;
-    let hello_bytes =
-        bincode::serde::encode_to_vec(&client_hello, bincode::config::standard())?;
-    stream.write_all(&hello_bytes).await?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    let (server_hello, _) = bincode::serde::decode_from_slice::<crate::kem::ServerHello, _>(
-        &buf[..n],
-        bincode::config::standard(),
-    )?;
-
-    let shared = crate::kem::client_finish(client_state, &server_hello)?;
-    let transcript = crate::kem::transcript(&client_hello, &server_hello);
-    let preauth = crate::kem::preauth_hash(&transcript);
-    let ikm = crate::kem::ikm_from_shared(&shared)?;
-    let keys = aead::SessionKeys::derive(&preauth, &ikm);
-    Ok((keys, preauth.to_vec()))
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
-pub async fn main_handshake_server(stream: &mut tokio::net::TcpStream) -> Result<(aead::SessionKeys, Vec<u8>)> {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    let (client_hello, _) = bincode::serde::decode_from_slice::<crate::kem::ClientHello, _>(
-        &buf[..n],
-        bincode::config::standard(),
-    )?;
-
-    let (server_hello, shared) = crate::kem::server_reply(&client_hello, HYBRID_MODE)?;
-    let reply =
-        bincode::serde::encode_to_vec(&server_hello, bincode::config::standard())?;
-    stream.write_all(&reply).await?;
-
-    let transcript = crate::kem::transcript(&client_hello, &server_hello);
-    let preauth = crate::kem::preauth_hash(&transcript);
-    let ikm = crate::kem::ikm_from_shared(&shared)?;
-    let keys = aead::SessionKeys::derive(&preauth, &ikm);
-    Ok((keys, preauth.to_vec()))
+fn load_key(path: &PathBuf) -> Result<Arc<[u8]>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read key {:?}", path))?;
+    Ok(Arc::from(bytes))
 }

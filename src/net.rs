@@ -1,127 +1,414 @@
 // src/net.rs
-use anyhow::Result;
-use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
-use crate::aead::{NonceCounter, aead_seal, aead_open};
-use crate::frame::{write_frame, read_frame};
+use std::{net::SocketAddr, sync::Arc};
 
-pub async fn run_server(bind: &str, forward_to: &str) -> Result<()> {
-    let listener = TcpListener::bind(bind).await?;
+use anyhow::{anyhow, bail, Context, Result};
+use pqcrypto_kyber::kyber768;
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
+use rand_core::{OsRng, RngCore};
+use x25519_dalek::{EphemeralSecret, PublicKey as XPublic};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use tracing::{debug, info, warn};
+
+use crate::{
+    aead::{self, NonceCounter, SessionRole},
+    frame::{read_frame, write_frame},
+    kem::{
+        self, build_transcript, ikm_from_shared, preauth_hash, Capabilities, ChosenSuite,
+        ClientAuth, ClientHello, KemAlgorithm, ServerHello, Shared, SigAlgorithm,
+        CLIENT_AUTH_MAGIC, CLIENT_HELLO_MAGIC, MAX_HANDSHAKE_LEN, PROTOCOL_VERSION,
+        SERVER_HELLO_MAGIC,
+    },
+    sig,
+};
+
+const HANDSHAKE_HEADER_LEN: usize = 10;
+
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub listen: String,
+    pub forward: String,
+    pub crypto: ServerCryptoConfig,
+}
+
+#[derive(Clone)]
+pub struct ServerCryptoConfig {
+    pub server_secret: Arc<[u8]>,
+    pub client_public: Arc<[u8]>,
+    pub hybrid: bool,
+    pub pq_required: bool,
+}
+
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub listen: String,
+    pub dial: String,
+    pub crypto: ClientCryptoConfig,
+}
+
+#[derive(Clone)]
+pub struct ClientCryptoConfig {
+    pub client_secret: Arc<[u8]>,
+    pub server_public: Arc<[u8]>,
+    pub hybrid: bool,
+    pub pq_required: bool,
+}
+
+pub async fn run_server(cfg: ServerConfig) -> Result<()> {
+    let listener = TcpListener::bind(&cfg.listen)
+        .await
+        .with_context(|| format!("failed to bind {}", cfg.listen))?;
+    info!(listen = %cfg.listen, forward = %cfg.forward, "server ready");
     loop {
-        let (tunnel_sock, _addr) = listener.accept().await?;
-        let forward_to = forward_to.to_string();
+        let (socket, addr) = listener.accept().await?;
+        let forward = cfg.forward.clone();
+        let crypto = cfg.crypto.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_server_conn(tunnel_sock, &forward_to).await {
-                eprintln!("[server] conn error: {e:?}");
+            if let Err(err) = handle_server_conn(socket, forward, crypto, addr).await {
+                warn!(?err, peer = %addr, "server connection closed with error");
             }
         });
     }
 }
 
-async fn handle_server_conn(mut tunnel: TcpStream, forward_to: &str) -> Result<()> {
-    // 1) handshake: receive ClientHello, send ServerHello, verify Dilithium, derive SessionKeys
-    // let (keys, aad) = handshake_server(&mut tunnel).await?;
-    let (keys, aad) = super::main_handshake_server(&mut tunnel).await?; // or wherever you put it
+pub async fn run_client(cfg: ClientConfig) -> Result<()> {
+    let listener = TcpListener::bind(&cfg.listen)
+        .await
+        .with_context(|| format!("failed to bind {}", cfg.listen))?;
+    info!(listen = %cfg.listen, dial = %cfg.dial, "client ready");
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        let dial = cfg.dial.clone();
+        let crypto = cfg.crypto.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_client_conn(socket, dial, crypto, addr).await {
+                warn!(?err, peer = %addr, "client connection closed with error");
+            }
+        });
+    }
+}
 
-    // 2) connect to real SMB
-    let smb = TcpStream::connect(forward_to).await?;
+async fn handle_server_conn(
+    mut tunnel: TcpStream,
+    forward_to: String,
+    crypto: ServerCryptoConfig,
+    peer: SocketAddr,
+) -> Result<()> {
+    let (keys, aad) = server_handshake(&mut tunnel, &crypto, Some(peer)).await?;
+    let smb = TcpStream::connect(&forward_to)
+        .await
+        .with_context(|| format!("connect {forward_to}"))?;
+    info!(%peer, "server handshake complete");
+    pump_streams(tunnel, smb, keys, aad).await
+}
 
-    // 3) start bidirectional pumps
-    let mut n_tx = NonceCounter::default();
+async fn handle_client_conn(
+    app: TcpStream,
+    dial: String,
+    crypto: ClientCryptoConfig,
+    peer: SocketAddr,
+) -> Result<()> {
+    let mut tunnel = TcpStream::connect(&dial)
+        .await
+        .with_context(|| format!("dial tunnel {dial}"))?;
+    let (keys, aad) = client_handshake(&mut tunnel, &crypto).await?;
+    info!(local = %peer, "client handshake complete");
+    pump_streams(tunnel, app, keys, aad).await
+}
+
+async fn pump_streams(
+    tunnel: TcpStream,
+    target: TcpStream,
+    keys: aead::SessionKeys,
+    aad: Arc<[u8]>,
+) -> Result<()> {
     let (mut tunnel_r, mut tunnel_w) = tunnel.into_split();
-    let (mut smb_r, mut smb_w) = smb.into_split();
+    let (mut dst_r, mut dst_w) = target.into_split();
 
-    // app -> server: decrypt from tunnel and write plaintext to SMB
     let rx_key = keys.rx;
-
+    let tx_key = keys.tx;
     let aad_rx = aad.clone();
-    let t1 = tokio::spawn(async move {
-        let aad = aad_rx;
+    let inbound = tokio::spawn(async move {
+        let mut last_nonce: Option<u64> = None;
         loop {
             let (nonce, ct) = read_frame(&mut tunnel_r).await?;
-            // (optional) track last nonce here if you need monotonic enforcement
-            let pt = aead_open(&rx_key, &nonce_to_12(nonce), &ct, &aad)?;
-            smb_w.write_all(&pt).await?;
+            if let Some(prev) = last_nonce {
+                if nonce <= prev {
+                    bail!("received out-of-order nonce {nonce} <= {prev}");
+                }
+            }
+            last_nonce = Some(nonce);
+            let pt = aead::aead_open(&rx_key, &nonce_to_12(nonce), &ct, &aad_rx)?;
+            dst_w.write_all(&pt).await?;
         }
-        #[allow(unreachable_code)] Ok::<(), anyhow::Error>(())
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
     });
 
-    // client app -> tunnel: read plaintext from SMB, encrypt, send to tunnel
-    let tx_key = keys.tx;
-
-    let t2 = tokio::spawn(async move {
-        let aad = aad;
-        let mut buf = vec![0u8; 16*1024];
+    let outbound = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut counter = NonceCounter::default();
         loop {
-            let n = smb_r.read(&mut buf).await?;
-            if n == 0 { break; }
-            let nonce = n_tx.next();
-            let ct = aead_seal(&tx_key, &nonce_to_12(nonce), &buf[..n], &aad)?;
+            let n = dst_r.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let nonce = counter.next();
+            let ct = aead::aead_seal(&tx_key, &nonce_to_12(nonce), &buf[..n], &aad)?;
             write_frame(&mut tunnel_w, nonce, &ct).await?;
         }
         Ok::<_, anyhow::Error>(())
     });
 
-    let _ = tokio::try_join!(t1, t2)?;
-    Ok(())
-}
-
-pub async fn run_client(listen: &str, dial: &str) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
-    loop {
-        let (app_sock, _addr) = listener.accept().await?;
-        let dial = dial.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client_conn(app_sock, &dial).await {
-                eprintln!("[client] conn error: {e:?}");
-            }
-        });
+    match tokio::try_join!(inbound, outbound) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(anyhow!(e)),
     }
 }
 
-async fn handle_client_conn(app: TcpStream, dial: &str) -> Result<()> {
-    let mut tunnel = TcpStream::connect(dial).await?;
+async fn client_handshake(
+    stream: &mut TcpStream,
+    crypto: &ClientCryptoConfig,
+) -> Result<(aead::SessionKeys, Arc<[u8]>)> {
+    let caps = Capabilities::new(crypto.hybrid, crypto.pq_required);
+    let (hello, state) = ClientHello::new(caps)?;
+    write_handshake_message(stream, HandshakeMessage::ClientHello, &hello.encode()).await?;
 
-    // handshake: send ClientHello, receive ServerHello, verify Dilithium, derive SessionKeys
-    let (keys, aad) = super::main_handshake_client(&mut tunnel).await?;
+    let (kind, payload) = read_handshake_message(stream).await?;
+    if !matches!(kind, HandshakeMessage::ServerHello) {
+        bail!("expected ServerHello, received {:?}", kind);
+    }
+    let server_hello = ServerHello::decode(&payload)?;
+    if server_hello.chosen_suite.kem != KemAlgorithm::Kyber768 {
+        bail!("server chose unsupported KEM");
+    }
+    if server_hello.chosen_suite.sig != SigAlgorithm::Dilithium2 {
+        bail!("server chose unsupported signature");
+    }
+    if crypto.pq_required && !matches!(server_hello.chosen_suite.kem, KemAlgorithm::Kyber768) {
+        bail!("pq_required but server did not offer PQ suite");
+    }
 
-    let mut n_tx = NonceCounter::default();
-    let (mut app_r, mut app_w) = app.into_split();
-    let (mut tun_r, mut tun_w) = tunnel.into_split();
+    let transcript = kem::transcript_from_messages(&hello, &server_hello);
+    sig::verify_detached(&transcript, &server_hello.signature, &crypto.server_public)?;
 
-    // app -> tunnel
-    let tx_key = keys.tx;
+    let shared = state.shared_with(&server_hello)?;
+    let preauth = kem::preauth_hash(&transcript);
+    let ikm = ikm_from_shared(&shared)?;
+    let keys = aead::SessionKeys::derive_for_role(&preauth, &ikm, SessionRole::Client);
+    let aad = Arc::from(preauth.to_vec());
 
-    let aad_tx = aad.clone();
-    let t1 = tokio::spawn(async move {
-        let aad = aad_tx;
-        let mut buf = vec![0u8; 16*1024];
-        loop {
-            let n = app_r.read(&mut buf).await?;
-            if n == 0 { break; }
-            let nonce = n_tx.next();
-            let ct = aead_seal(&tx_key, &nonce_to_12(nonce), &buf[..n], &aad)?;
-            write_frame(&mut tun_w, nonce, &ct).await?;
+    let auth = ClientAuth {
+        signature: sig::sign_detached(&transcript, &crypto.client_secret)?,
+    };
+    write_handshake_message(stream, HandshakeMessage::ClientAuth, &auth.encode()).await?;
+    Ok((keys, aad))
+}
+
+async fn server_handshake(
+    stream: &mut TcpStream,
+    crypto: &ServerCryptoConfig,
+    peer: Option<SocketAddr>,
+) -> Result<(aead::SessionKeys, Arc<[u8]>)> {
+    let (kind, payload) = read_handshake_message(stream).await?;
+    if !matches!(kind, HandshakeMessage::ClientHello) {
+        bail!("expected ClientHello, received {:?}", kind);
+    }
+    let client_hello = ClientHello::decode(&payload)?;
+    if !client_hello
+        .caps
+        .kem_list
+        .iter()
+        .any(|k| *k == KemAlgorithm::Kyber768)
+    {
+        bail!("client missing Kyber768 support");
+    }
+    if !client_hello
+        .caps
+        .sig_list
+        .iter()
+        .any(|s| *s == SigAlgorithm::Dilithium2)
+    {
+        bail!("client missing Dilithium2 support");
+    }
+    if client_hello.caps.pq_required && !crypto.pq_required {
+        bail!("client demands pq_required but server disabled it");
+    }
+
+    let mut server_random = [0u8; 32];
+    OsRng.fill_bytes(&mut server_random);
+    let x_secret = EphemeralSecret::random_from_rng(OsRng);
+    let x_pub = XPublic::from(&x_secret).to_bytes();
+
+    let client_pk = kyber768::PublicKey::from_bytes(&client_hello.kyber_pub)
+        .map_err(|e| anyhow!("invalid client Kyber pk: {e:?}"))?;
+    let (ss_pq, ct) = kyber768::encapsulate(&client_pk);
+    let use_hybrid = crypto.hybrid && client_hello.caps.hybrid;
+    let classical = if use_hybrid {
+        Some(x_secret.diffie_hellman(&XPublic::from(client_hello.x_pub)).to_bytes())
+    } else {
+        None
+    };
+    let shared = Shared {
+        classical,
+        pq: ss_pq.as_bytes().to_vec(),
+    };
+    let chosen_suite = ChosenSuite {
+        kem: KemAlgorithm::Kyber768,
+        sig: SigAlgorithm::Dilithium2,
+        hybrid: use_hybrid,
+    };
+    let suite_bytes = chosen_suite.encode();
+    let ct_bytes = ct.as_bytes().to_vec();
+    let transcript = build_transcript(
+        &client_hello.random,
+        &server_random,
+        &client_hello.x_pub,
+        &x_pub,
+        &client_hello.kyber_pub,
+        &ct_bytes,
+        &client_hello.caps_encoded,
+        &suite_bytes,
+    );
+    let signature = sig::sign_detached(&transcript, &crypto.server_secret)?;
+    let server_hello = ServerHello {
+        random: server_random,
+        x_pub,
+        kyber_ct: ct_bytes,
+        chosen_suite,
+        chosen_suite_encoded: suite_bytes.clone(),
+        signature,
+    };
+    write_handshake_message(stream, HandshakeMessage::ServerHello, &server_hello.encode()).await?;
+    debug!(?peer, "sent ServerHello");
+
+    let (kind, payload) = read_handshake_message(stream).await?;
+    if !matches!(kind, HandshakeMessage::ClientAuth) {
+        bail!("expected ClientAuth, received {:?}", kind);
+    }
+    let client_auth = ClientAuth::decode(&payload)?;
+    sig::verify_detached(&transcript, &client_auth.signature, &crypto.client_public)?;
+
+    let preauth = preauth_hash(&transcript);
+    let ikm = ikm_from_shared(&shared)?;
+    let keys = aead::SessionKeys::derive_for_role(&preauth, &ikm, SessionRole::Server);
+    let aad = Arc::from(preauth.to_vec());
+    Ok((keys, aad))
+}
+
+#[derive(Debug)]
+enum HandshakeMessage {
+    ClientHello,
+    ServerHello,
+    ClientAuth,
+}
+
+impl HandshakeMessage {
+    fn magic(self) -> &'static [u8; 4] {
+        match self {
+            HandshakeMessage::ClientHello => CLIENT_HELLO_MAGIC,
+            HandshakeMessage::ServerHello => SERVER_HELLO_MAGIC,
+            HandshakeMessage::ClientAuth => CLIENT_AUTH_MAGIC,
         }
-        Ok::<_, anyhow::Error>(())
-    });
+    }
 
-    // tunnel -> app
-    let rx_key = keys.rx;
-
-    let t2 = tokio::spawn(async move {
-        let aad = aad;
-        loop {
-            let (nonce, ct) = read_frame(&mut tun_r).await?;
-            let pt = aead_open(&rx_key, &nonce_to_12(nonce), &ct, &aad)?;
-            app_w.write_all(&pt).await?;
+    fn from_magic(bytes: &[u8]) -> Result<Self> {
+        match bytes {
+            b if b == CLIENT_HELLO_MAGIC => Ok(HandshakeMessage::ClientHello),
+            b if b == SERVER_HELLO_MAGIC => Ok(HandshakeMessage::ServerHello),
+            b if b == CLIENT_AUTH_MAGIC => Ok(HandshakeMessage::ClientAuth),
+            other => Err(anyhow!("unknown handshake magic {:?}", other)),
         }
-        #[allow(unreachable_code)] Ok::<(), anyhow::Error>(())
-    });
+    }
+}
 
-    let _ = tokio::try_join!(t1, t2)?;
+async fn read_handshake_message(stream: &mut TcpStream) -> Result<(HandshakeMessage, Vec<u8>)> {
+    let mut header = [0u8; HANDSHAKE_HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let kind = HandshakeMessage::from_magic(&header[..4])?;
+    let version = u16::from_be_bytes([header[4], header[5]]);
+    if version != PROTOCOL_VERSION {
+        bail!("protocol version mismatch {version}");
+    }
+    let len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    if len > MAX_HANDSHAKE_LEN {
+        bail!("handshake payload too large: {len}");
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    Ok((kind, payload))
+}
+
+async fn write_handshake_message(
+    stream: &mut TcpStream,
+    kind: HandshakeMessage,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() > MAX_HANDSHAKE_LEN {
+        bail!("handshake payload too large: {}", payload.len());
+    }
+    let mut header = [0u8; HANDSHAKE_HEADER_LEN];
+    header[..4].copy_from_slice(kind.magic());
+    header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    header[6..10].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header).await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-fn nonce_to_12(n: u64) -> [u8;12] {
-    let mut out = [0u8;12]; out[4..].copy_from_slice(&n.to_be_bytes()); out
+fn nonce_to_12(n: u64) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[4..].copy_from_slice(&n.to_be_bytes());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sig;
+
+    #[tokio::test]
+    async fn handshake_roundtrip() -> Result<()> {
+        let (server_pk, server_sk) = sig::generate_keys();
+        let (client_pk, client_sk) = sig::generate_keys();
+        let server_cfg = ServerCryptoConfig {
+            server_secret: Arc::from(server_sk.clone()),
+            client_public: Arc::from(client_pk.clone()),
+            hybrid: true,
+            pq_required: true,
+        };
+        let client_cfg = ClientCryptoConfig {
+            client_secret: Arc::from(client_sk.clone()),
+            server_public: Arc::from(server_pk.clone()),
+            hybrid: true,
+            pq_required: true,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let server_task = tokio::spawn({
+            let server_cfg = server_cfg.clone();
+            async move {
+                let (mut sock, peer) = listener.accept().await?;
+                server_handshake(&mut sock, &server_cfg, Some(peer)).await
+            }
+        });
+
+        let client_task = tokio::spawn({
+            let client_cfg = client_cfg.clone();
+            async move {
+                let mut sock = TcpStream::connect(addr).await?;
+                client_handshake(&mut sock, &client_cfg).await
+            }
+        });
+
+        let (server_res, client_res) = tokio::join!(server_task, client_task);
+        let (_, server_aad) = server_res??;
+        let (_, client_aad) = client_res??;
+        assert_eq!(&*server_aad, &*client_aad);
+        Ok(())
+    }
 }
