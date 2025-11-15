@@ -1,10 +1,7 @@
 use anyhow::{anyhow, Result};
 use pqcrypto_dilithium::dilithium2;
-use pqcrypto_traits::sign::{
-    DetachedSignature as _, PublicKey as _, SecretKey as _,
-};
+use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 
-#[cfg(test)]
 pub fn generate_keys() -> (Vec<u8>, Vec<u8>) {
     let (pk, sk) = dilithium2::keypair();
     (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())

@@ -67,8 +67,16 @@ impl Capabilities {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        push_tlv_u16_list(&mut out, TLV_KEM_LIST, self.kem_list.iter().map(|k| *k as u16));
-        push_tlv_u16_list(&mut out, TLV_SIG_LIST, self.sig_list.iter().map(|s| *s as u16));
+        push_tlv_u16_list(
+            &mut out,
+            TLV_KEM_LIST,
+            self.kem_list.iter().map(|k| *k as u16),
+        );
+        push_tlv_u16_list(
+            &mut out,
+            TLV_SIG_LIST,
+            self.sig_list.iter().map(|s| *s as u16),
+        );
         push_tlv_bool(&mut out, TLV_HYBRID, self.hybrid);
         push_tlv_bool(&mut out, TLV_PQ_REQUIRED, self.pq_required);
         out
@@ -252,7 +260,10 @@ impl ServerHello {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        ensure!(payload.len() >= 32 + 32 + 2 + 2 + 2, "server hello too short");
+        ensure!(
+            payload.len() >= 32 + 32 + 2 + 2 + 2,
+            "server hello too short"
+        );
         let mut cursor = payload;
         let mut random = [0u8; 32];
         random.copy_from_slice(&cursor[..32]);
@@ -373,7 +384,10 @@ pub fn build_transcript(
     suite_encoded: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        4 + 32 + 32 + 32 + 32
+        4 + 32
+            + 32
+            + 32
+            + 32
             + client_kyber_pub.len()
             + server_kyber_ct.len()
             + caps_encoded.len()

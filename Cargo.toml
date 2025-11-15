@@ -30,3 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [build-dependencies]
 cc = "1"
+
+[[bin]]
+name = "gen-keys"
+path = "src/gen_keys.rs"

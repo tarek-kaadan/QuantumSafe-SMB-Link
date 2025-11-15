@@ -1,30 +1,30 @@
 // src/net.rs
 use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use pqcrypto_kyber::kyber768;
 use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use rand_core::{OsRng, RngCore};
-use x25519_dalek::{EphemeralSecret, PublicKey as XPublic};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tracing::{debug, info, warn};
+use x25519_dalek::{EphemeralSecret, PublicKey as XPublic};
 
 use crate::{
-    aead::{self, NonceCounter, SessionRole},
+    aead::{self, NonceCounter},
     frame::{read_frame, write_frame},
     kem::{
-        self, build_transcript, ikm_from_shared, preauth_hash, Capabilities, ChosenSuite,
-        ClientAuth, ClientHello, KemAlgorithm, ServerHello, Shared, SigAlgorithm,
-        CLIENT_AUTH_MAGIC, CLIENT_HELLO_MAGIC, MAX_HANDSHAKE_LEN, PROTOCOL_VERSION,
-        SERVER_HELLO_MAGIC,
+        self, build_transcript, preauth_hash, Capabilities, ChosenSuite, ClientAuth, ClientHello,
+        KemAlgorithm, ServerHello, Shared, SigAlgorithm, CLIENT_AUTH_MAGIC, CLIENT_HELLO_MAGIC,
+        MAX_HANDSHAKE_LEN, PROTOCOL_VERSION, SERVER_HELLO_MAGIC,
     },
     sig,
 };
 
 const HANDSHAKE_HEADER_LEN: usize = 10;
+const FRAME_AAD: [u8; 23] = *b"QuantumSafe-SMB-Link v1";
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -96,12 +96,13 @@ async fn handle_server_conn(
     crypto: ServerCryptoConfig,
     peer: SocketAddr,
 ) -> Result<()> {
-    let (keys, aad) = server_handshake(&mut tunnel, &crypto, Some(peer)).await?;
+    info!(%peer, "server starting PQ handshake");
+    let keys = server_handshake(&mut tunnel, &crypto, Some(peer)).await?;
     let smb = TcpStream::connect(&forward_to)
         .await
         .with_context(|| format!("connect {forward_to}"))?;
-    info!(%peer, "server handshake complete");
-    pump_streams(tunnel, smb, keys, aad).await
+    info!(%peer, "server handshake complete; forwarding traffic");
+    pump_streams(tunnel, smb, keys).await
 }
 
 async fn handle_client_conn(
@@ -113,23 +114,19 @@ async fn handle_client_conn(
     let mut tunnel = TcpStream::connect(&dial)
         .await
         .with_context(|| format!("dial tunnel {dial}"))?;
-    let (keys, aad) = client_handshake(&mut tunnel, &crypto).await?;
-    info!(local = %peer, "client handshake complete");
-    pump_streams(tunnel, app, keys, aad).await
+    info!(local = %peer, remote = %dial, "client starting PQ handshake");
+    let keys = client_handshake(&mut tunnel, &crypto).await?;
+    info!(local = %peer, remote = %dial, "client handshake complete; tunnel ready");
+    pump_streams(tunnel, app, keys).await
 }
 
-async fn pump_streams(
-    tunnel: TcpStream,
-    target: TcpStream,
-    keys: aead::SessionKeys,
-    aad: Arc<[u8]>,
-) -> Result<()> {
+async fn pump_streams(tunnel: TcpStream, target: TcpStream, keys: aead::SessionKeys) -> Result<()> {
     let (mut tunnel_r, mut tunnel_w) = tunnel.into_split();
     let (mut dst_r, mut dst_w) = target.into_split();
 
     let rx_key = keys.rx;
     let tx_key = keys.tx;
-    let aad_rx = aad.clone();
+    let aad_rx = FRAME_AAD.as_slice();
     let inbound = tokio::spawn(async move {
         let mut last_nonce: Option<u64> = None;
         loop {
@@ -140,7 +137,7 @@ async fn pump_streams(
                 }
             }
             last_nonce = Some(nonce);
-            let pt = aead::aead_open(&rx_key, &nonce_to_12(nonce), &ct, &aad_rx)?;
+            let pt = aead::aead_open(&rx_key, &nonce_to_12(nonce), &ct, aad_rx)?;
             dst_w.write_all(&pt).await?;
         }
         #[allow(unreachable_code)]
@@ -150,13 +147,14 @@ async fn pump_streams(
     let outbound = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         let mut counter = NonceCounter::default();
+        let aad_tx = FRAME_AAD.as_slice();
         loop {
             let n = dst_r.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             let nonce = counter.next();
-            let ct = aead::aead_seal(&tx_key, &nonce_to_12(nonce), &buf[..n], &aad)?;
+            let ct = aead::aead_seal(&tx_key, &nonce_to_12(nonce), &buf[..n], aad_tx)?;
             write_frame(&mut tunnel_w, nonce, &ct).await?;
         }
         Ok::<_, anyhow::Error>(())
@@ -171,7 +169,7 @@ async fn pump_streams(
 async fn client_handshake(
     stream: &mut TcpStream,
     crypto: &ClientCryptoConfig,
-) -> Result<(aead::SessionKeys, Arc<[u8]>)> {
+) -> Result<aead::SessionKeys> {
     let caps = Capabilities::new(crypto.hybrid, crypto.pq_required);
     let (hello, state) = ClientHello::new(caps)?;
     write_handshake_message(stream, HandshakeMessage::ClientHello, &hello.encode()).await?;
@@ -193,25 +191,30 @@ async fn client_handshake(
 
     let transcript = kem::transcript_from_messages(&hello, &server_hello);
     sig::verify_detached(&transcript, &server_hello.signature, &crypto.server_public)?;
+    let mode = if server_hello.chosen_suite.hybrid {
+        "hybrid"
+    } else {
+        "pq-only"
+    };
+    info!(mode = mode, "client handshake: server selected suite");
 
     let shared = state.shared_with(&server_hello)?;
     let preauth = kem::preauth_hash(&transcript);
-    let ikm = ikm_from_shared(&shared)?;
-    let keys = aead::SessionKeys::derive_for_role(&preauth, &ikm, SessionRole::Client);
-    let aad = Arc::from(preauth.to_vec());
+    let classical = shared.classical.as_ref().map(|c| &c[..]);
+    let keys = aead::SessionKeys::from_shared(&preauth, classical, &shared.pq, false)?;
 
     let auth = ClientAuth {
         signature: sig::sign_detached(&transcript, &crypto.client_secret)?,
     };
     write_handshake_message(stream, HandshakeMessage::ClientAuth, &auth.encode()).await?;
-    Ok((keys, aad))
+    Ok(keys)
 }
 
 async fn server_handshake(
     stream: &mut TcpStream,
     crypto: &ServerCryptoConfig,
     peer: Option<SocketAddr>,
-) -> Result<(aead::SessionKeys, Arc<[u8]>)> {
+) -> Result<aead::SessionKeys> {
     let (kind, payload) = read_handshake_message(stream).await?;
     if !matches!(kind, HandshakeMessage::ClientHello) {
         bail!("expected ClientHello, received {:?}", kind);
@@ -247,7 +250,11 @@ async fn server_handshake(
     let (ss_pq, ct) = kyber768::encapsulate(&client_pk);
     let use_hybrid = crypto.hybrid && client_hello.caps.hybrid;
     let classical = if use_hybrid {
-        Some(x_secret.diffie_hellman(&XPublic::from(client_hello.x_pub)).to_bytes())
+        Some(
+            x_secret
+                .diffie_hellman(&XPublic::from(client_hello.x_pub))
+                .to_bytes(),
+        )
     } else {
         None
     };
@@ -281,7 +288,14 @@ async fn server_handshake(
         chosen_suite_encoded: suite_bytes.clone(),
         signature,
     };
-    write_handshake_message(stream, HandshakeMessage::ServerHello, &server_hello.encode()).await?;
+    let mode = if use_hybrid { "hybrid" } else { "pq-only" };
+    info!(?peer, mode = mode, "server handshake: sending ServerHello");
+    write_handshake_message(
+        stream,
+        HandshakeMessage::ServerHello,
+        &server_hello.encode(),
+    )
+    .await?;
     debug!(?peer, "sent ServerHello");
 
     let (kind, payload) = read_handshake_message(stream).await?;
@@ -292,10 +306,55 @@ async fn server_handshake(
     sig::verify_detached(&transcript, &client_auth.signature, &crypto.client_public)?;
 
     let preauth = preauth_hash(&transcript);
-    let ikm = ikm_from_shared(&shared)?;
-    let keys = aead::SessionKeys::derive_for_role(&preauth, &ikm, SessionRole::Server);
-    let aad = Arc::from(preauth.to_vec());
-    Ok((keys, aad))
+    let classical = shared.classical.as_ref().map(|c| &c[..]);
+    let keys = aead::SessionKeys::from_shared(&preauth, classical, &shared.pq, true)?;
+    Ok(keys)
+}
+
+pub async fn handshake_self_test(hybrid: bool) -> Result<()> {
+    info!(hybrid = hybrid, "running in-memory handshake self-test");
+    let (server_pk, server_sk) = sig::generate_keys();
+    let (client_pk, client_sk) = sig::generate_keys();
+    let server_cfg = ServerCryptoConfig {
+        server_secret: Arc::from(server_sk),
+        client_public: Arc::from(client_pk),
+        hybrid,
+        pq_required: true,
+    };
+    let client_cfg = ClientCryptoConfig {
+        client_secret: Arc::from(client_sk),
+        server_public: Arc::from(server_pk),
+        hybrid,
+        pq_required: true,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let server_task = tokio::spawn({
+        let server_cfg = server_cfg.clone();
+        async move {
+            let (mut sock, peer) = listener.accept().await?;
+            server_handshake(&mut sock, &server_cfg, Some(peer)).await
+        }
+    });
+
+    let client_task = tokio::spawn({
+        let client_cfg = client_cfg.clone();
+        async move {
+            let mut sock = TcpStream::connect(addr).await?;
+            client_handshake(&mut sock, &client_cfg).await
+        }
+    });
+
+    let (server_res, client_res) = tokio::join!(server_task, client_task);
+    let server_keys = server_res??;
+    let client_keys = client_res??;
+    ensure!(
+        server_keys.tx == client_keys.rx && server_keys.rx == client_keys.tx,
+        "handshake self-test produced mismatched keys"
+    );
+    info!(hybrid = hybrid, "handshake self-test passed");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -406,9 +465,10 @@ mod tests {
         });
 
         let (server_res, client_res) = tokio::join!(server_task, client_task);
-        let (_, server_aad) = server_res??;
-        let (_, client_aad) = client_res??;
-        assert_eq!(&*server_aad, &*client_aad);
+        let server_keys = server_res??;
+        let client_keys = client_res??;
+        assert_eq!(server_keys.tx, client_keys.rx);
+        assert_eq!(server_keys.rx, client_keys.tx);
         Ok(())
     }
 }

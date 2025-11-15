@@ -1,5 +1,5 @@
 // src/frame.rs
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(mut w: W, nonce: u64, ct: &[u8]) -> Result<()> {
@@ -13,7 +13,9 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(mut w: W, nonce: u64, ct: &[u
 
 pub async fn read_frame<R: AsyncReadExt + Unpin>(mut r: R) -> Result<(u64, Vec<u8>)> {
     let len = r.read_u32_le().await?;
-    if len < 8 { bail!("frame too short"); }
+    if len < 8 {
+        bail!("frame too short");
+    }
     let nonce = r.read_u64_le().await?;
     let mut buf = vec![0u8; (len - 8) as usize];
     r.read_exact(&mut buf).await?;
