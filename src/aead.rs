@@ -48,7 +48,7 @@ impl SessionKeys {
     fn swap_directions(&mut self) {
         let outgoing = self.outgoing;
         self.outgoing = self.incoming;
-        self.outgoing = outgoing;
+        self.incoming = outgoing;
     }
 }
 
