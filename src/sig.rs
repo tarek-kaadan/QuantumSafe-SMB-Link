@@ -10,7 +10,6 @@ pub fn generate_keys() -> (Vec<u8>, Vec<u8>) {
 pub fn sign_detached(msg: &[u8], sk_bytes: &[u8]) -> Result<Vec<u8>> {
     let sk = dilithium2::SecretKey::from_bytes(sk_bytes)
         .map_err(|e| anyhow!("invalid Dilithium secret key: {:?}", e))?;
-    // correct name is `detached_sign`, not `sign_detached`
     let sig = dilithium2::detached_sign(msg, &sk);
     Ok(sig.as_bytes().to_vec())
 }

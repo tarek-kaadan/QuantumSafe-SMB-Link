@@ -9,34 +9,35 @@ use sha2::Sha256;
 
 #[derive(Clone)]
 pub struct SessionKeys {
-    pub tx: [u8; 32],
-    pub rx: [u8; 32],
+    pub outgoing: [u8; 32],
+    pub incoming: [u8; 32],
 }
 
 impl SessionKeys {
     fn derive(preauth: &[u8], ikm: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(preauth), ikm);
-        let mut tx = [0u8; 32];
-        let mut rx = [0u8; 32];
-        hk.expand(b"pq-smb tx v1", &mut tx).unwrap();
-        hk.expand(b"pq-smb rx v1", &mut rx).unwrap();
-        Self { tx, rx }
+        let mut outgoing = [0u8; 32];
+        let mut incoming = [0u8; 32];
+        hk.expand(b"outgoing v1", &mut outgoing).unwrap();
+        hk.expand(b"incoming v1", &mut incoming).unwrap();
+        Self { outgoing, incoming }
     }
 
     pub fn from_shared(
         transcript_salt: &[u8],
         classical: Option<&[u8]>,
-        pq: &[u8],
+        post_quantum: &[u8],
         is_server: bool,
     ) -> Result<Self> {
-        if classical.is_none() && pq.is_empty() {
+        if classical.is_none() && post_quantum.is_empty() {
             bail!("missing shared secret material");
         }
-        let mut ikm = Vec::with_capacity(classical.map(|c| c.len()).unwrap_or(0) + pq.len());
+        // concatenate whatever shared secret material we ended up with
+        let mut ikm = Vec::with_capacity(classical.map(|c| c.len()).unwrap_or(0) + post_quantum.len());
         if let Some(bytes) = classical {
             ikm.extend_from_slice(bytes);
         }
-        ikm.extend_from_slice(pq);
+        ikm.extend_from_slice(post_quantum);
         let mut keys = Self::derive(transcript_salt, &ikm);
         if is_server {
             keys.swap_directions();
@@ -45,16 +46,16 @@ impl SessionKeys {
     }
 
     fn swap_directions(&mut self) {
-        let tx = self.tx;
-        self.tx = self.rx;
-        self.rx = tx;
+        let outgoing = self.outgoing;
+        self.outgoing = self.incoming;
+        self.outgoing = outgoing;
     }
 }
 
 #[derive(Default, Clone)]
-pub struct NonceCounter(u64);
+pub struct NonceTicker(u64);
 
-impl NonceCounter {
+impl NonceTicker {
     pub fn next(&mut self) -> u64 {
         let n = self.0;
         self.0 = self.0.checked_add(1).expect("nonce overflow");
@@ -113,8 +114,8 @@ mod tests {
         let pq = [0x42u8; 32];
         let client = SessionKeys::from_shared(transcript, Some(&classical), &pq, false)?;
         let server = SessionKeys::from_shared(transcript, Some(&classical), &pq, true)?;
-        assert_eq!(client.tx, server.rx);
-        assert_eq!(client.rx, server.tx);
+        assert_eq!(client.outgoing, server.incoming);
+        assert_eq!(client.incoming, server.outgoing);
         Ok(())
     }
 }

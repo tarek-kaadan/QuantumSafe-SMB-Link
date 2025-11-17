@@ -13,8 +13,7 @@ use tracing::{debug, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey as XPublic};
 
 use crate::{
-    aead::{self, NonceCounter},
-    frame::{read_frame, write_frame},
+    aead::{self, NonceTicker},
     kem::{
         self, build_transcript, preauth_hash, Capabilities, ChosenSuite, ClientAuth, ClientHello,
         KemAlgorithm, ServerHello, Shared, SigAlgorithm, CLIENT_AUTH_MAGIC, CLIENT_HELLO_MAGIC,
@@ -60,7 +59,7 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("failed to bind {}", cfg.listen))?;
-    info!(listen = %cfg.listen, forward = %cfg.forward, "server ready");
+    info!(listen = %cfg.listen, forward = %cfg.forward, "server waiting for tunnel peers");
     loop {
         let (socket, addr) = listener.accept().await?;
         let forward = cfg.forward.clone();
@@ -77,7 +76,7 @@ pub async fn run_client(cfg: ClientConfig) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("failed to bind {}", cfg.listen))?;
-    info!(listen = %cfg.listen, dial = %cfg.dial, "client ready");
+    info!(listen = %cfg.listen, dial = %cfg.dial, "client shim listening for SMB apps");
     loop {
         let (socket, addr) = listener.accept().await?;
         let dial = cfg.dial.clone();
@@ -96,12 +95,12 @@ async fn handle_server_conn(
     crypto: ServerCryptoConfig,
     peer: SocketAddr,
 ) -> Result<()> {
-    info!(%peer, "server starting PQ handshake");
+    info!(%peer, "server running the PQ handshake dance");
     let keys = server_handshake(&mut tunnel, &crypto, Some(peer)).await?;
     let smb = TcpStream::connect(&forward_to)
         .await
         .with_context(|| format!("connect {forward_to}"))?;
-    info!(%peer, "server handshake complete; forwarding traffic");
+    info!(%peer, "server handshake done, wiring tunnel into SMB backend");
     pump_streams(tunnel, smb, keys).await
 }
 
@@ -114,18 +113,20 @@ async fn handle_client_conn(
     let mut tunnel = TcpStream::connect(&dial)
         .await
         .with_context(|| format!("dial tunnel {dial}"))?;
-    info!(local = %peer, remote = %dial, "client starting PQ handshake");
+    info!(local = %peer, remote = %dial, "client dialing tunnel and starting handshake");
     let keys = client_handshake(&mut tunnel, &crypto).await?;
-    info!(local = %peer, remote = %dial, "client handshake complete; tunnel ready");
+    info!(local = %peer, remote = %dial, "client handshake finished — piping traffic through");
     pump_streams(tunnel, app, keys).await
 }
 
+/// Glue the tunnel socket to the real SMB socket; this is intentionally
+/// straightforward so it's easy to debug when something breaks at 3 a.m.
 async fn pump_streams(tunnel: TcpStream, target: TcpStream, keys: aead::SessionKeys) -> Result<()> {
     let (mut tunnel_r, mut tunnel_w) = tunnel.into_split();
     let (mut dst_r, mut dst_w) = target.into_split();
 
-    let rx_key = keys.rx;
-    let tx_key = keys.tx;
+    let rx_key = keys.incoming;
+    let tx_key = keys.outgoing;
     let aad_rx = FRAME_AAD.as_slice();
     let inbound = tokio::spawn(async move {
         let mut last_nonce: Option<u64> = None;
@@ -146,7 +147,7 @@ async fn pump_streams(tunnel: TcpStream, target: TcpStream, keys: aead::SessionK
 
     let outbound = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
-        let mut counter = NonceCounter::default();
+        let mut counter = NonceTicker::default();
         let aad_tx = FRAME_AAD.as_slice();
         loop {
             let n = dst_r.read(&mut buf).await?;
@@ -176,14 +177,14 @@ async fn client_handshake(
 
     let (kind, payload) = read_handshake_message(stream).await?;
     if !matches!(kind, HandshakeMessage::ServerHello) {
-        bail!("expected ServerHello, received {:?}", kind);
+        bail!("expected ServerHello but got {:?}", kind);
     }
     let server_hello = ServerHello::decode(&payload)?;
     if server_hello.chosen_suite.kem != KemAlgorithm::Kyber768 {
-        bail!("server chose unsupported KEM");
+        bail!("server replied with an unsupported KEM");
     }
     if server_hello.chosen_suite.sig != SigAlgorithm::Dilithium2 {
-        bail!("server chose unsupported signature");
+        bail!("server replied with an unsupported signature scheme");
     }
     if crypto.pq_required && !matches!(server_hello.chosen_suite.kem, KemAlgorithm::Kyber768) {
         bail!("pq_required but server did not offer PQ suite");
@@ -196,7 +197,8 @@ async fn client_handshake(
     } else {
         "pq-only"
     };
-    info!(mode = mode, "client handshake: server selected suite");
+    info!(mode = mode, "client handshake: server picked its suite");
+    debug!(?server_hello.chosen_suite, "client handshake: peer capabilities looked fine");
 
     let shared = state.shared_with(&server_hello)?;
     let preauth = kem::preauth_hash(&transcript);
@@ -226,7 +228,7 @@ async fn server_handshake(
         .iter()
         .any(|k| *k == KemAlgorithm::Kyber768)
     {
-        bail!("client missing Kyber768 support");
+        bail!("client didn't advertise Kyber768 support");
     }
     if !client_hello
         .caps
@@ -234,7 +236,7 @@ async fn server_handshake(
         .iter()
         .any(|s| *s == SigAlgorithm::Dilithium2)
     {
-        bail!("client missing Dilithium2 support");
+        bail!("client didn't advertise Dilithium2 support");
     }
     if client_hello.caps.pq_required && !crypto.pq_required {
         bail!("client demands pq_required but server disabled it");
@@ -249,6 +251,7 @@ async fn server_handshake(
         .map_err(|e| anyhow!("invalid client Kyber pk: {e:?}"))?;
     let (ss_pq, ct) = kyber768::encapsulate(&client_pk);
     let use_hybrid = crypto.hybrid && client_hello.caps.hybrid;
+    // Hybrid mode piggybacks the classical X25519 secret in addition to Kyber.
     let classical = if use_hybrid {
         Some(
             x_secret
@@ -290,6 +293,7 @@ async fn server_handshake(
     };
     let mode = if use_hybrid { "hybrid" } else { "pq-only" };
     info!(?peer, mode = mode, "server handshake: sending ServerHello");
+    debug!(?peer, "server handshake: client advertised caps {:?}", client_hello.caps);
     write_handshake_message(
         stream,
         HandshakeMessage::ServerHello,
@@ -350,7 +354,7 @@ pub async fn handshake_self_test(hybrid: bool) -> Result<()> {
     let server_keys = server_res??;
     let client_keys = client_res??;
     ensure!(
-        server_keys.tx == client_keys.rx && server_keys.rx == client_keys.tx,
+        server_keys.outgoing == client_keys.incoming && server_keys.incoming == client_keys.outgoing,
         "handshake self-test produced mismatched keys"
     );
     info!(hybrid = hybrid, "handshake self-test passed");
@@ -424,6 +428,27 @@ fn nonce_to_12(n: u64) -> [u8; 12] {
     out
 }
 
+async fn write_frame<W: AsyncWriteExt + Unpin>(mut w: W, nonce: u64, ct: &[u8]) -> Result<()> {
+    // Frame format: len (u32 LE) | nonce (u64 LE) | ciphertext bytes.
+    let len: u32 = (8 + ct.len()) as u32;
+    w.write_u32_le(len).await?;
+    w.write_u64_le(nonce).await?;
+    w.write_all(ct).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+async fn read_frame<R: AsyncReadExt + Unpin>(mut r: R) -> Result<(u64, Vec<u8>)> {
+    let len = r.read_u32_le().await?;
+    if len < 8 {
+        bail!("frame declared shorter than nonce field");
+    }
+    let nonce = r.read_u64_le().await?;
+    let mut buf = vec![0u8; (len - 8) as usize];
+    r.read_exact(&mut buf).await?;
+    Ok((nonce, buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,8 +492,8 @@ mod tests {
         let (server_res, client_res) = tokio::join!(server_task, client_task);
         let server_keys = server_res??;
         let client_keys = client_res??;
-        assert_eq!(server_keys.tx, client_keys.rx);
-        assert_eq!(server_keys.rx, client_keys.tx);
+        assert_eq!(server_keys.outgoing, client_keys.incoming);
+        assert_eq!(server_keys.incoming, client_keys.outgoing);
         Ok(())
     }
 }

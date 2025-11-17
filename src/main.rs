@@ -6,7 +6,6 @@
 //! Point `--forward 127.0.0.1:445` at the SMB server you want to protect (Windows or Samba).
 // src/main.rs
 mod aead;
-mod frame;
 mod kem;
 mod net;
 mod sig;
