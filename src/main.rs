@@ -1,9 +1,3 @@
-//! QuantumSafe-SMB-Link CLI quick reference:
-//! - `quantumsafe-smb-link handshake-test --hybrid on`
-//! - `quantumsafe-smb-link server --bind 0.0.0.0:7445 --forward 127.0.0.1:445 --hybrid on`
-//! - `quantumsafe-smb-link client --bind 127.0.0.1:1445 --connect SERVER_IP:7445 --hybrid on`
-//!
-//! Point `--forward 127.0.0.1:445` at the SMB server you want to protect (Windows or Samba).
 // src/main.rs
 mod aead;
 mod kem;

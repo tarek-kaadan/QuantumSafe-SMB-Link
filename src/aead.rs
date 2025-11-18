@@ -1,4 +1,3 @@
-// src/aead.rs
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -32,7 +31,6 @@ impl SessionKeys {
         if classical.is_none() && post_quantum.is_empty() {
             bail!("missing shared secret material");
         }
-        // concatenate whatever shared secret material we ended up with
         let mut ikm = Vec::with_capacity(classical.map(|c| c.len()).unwrap_or(0) + post_quantum.len());
         if let Some(bytes) = classical {
             ikm.extend_from_slice(bytes);

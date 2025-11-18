@@ -119,8 +119,6 @@ async fn handle_client_conn(
     pump_streams(tunnel, app, keys).await
 }
 
-/// Glue the tunnel socket to the real SMB socket; this is intentionally
-/// straightforward so it's easy to debug when something breaks at 3 a.m.
 async fn pump_streams(tunnel: TcpStream, target: TcpStream, keys: aead::SessionKeys) -> Result<()> {
     let (mut tunnel_r, mut tunnel_w) = tunnel.into_split();
     let (mut dst_r, mut dst_w) = target.into_split();
@@ -251,7 +249,6 @@ async fn server_handshake(
         .map_err(|e| anyhow!("invalid client Kyber pk: {e:?}"))?;
     let (ss_pq, ct) = kyber768::encapsulate(&client_pk);
     let use_hybrid = crypto.hybrid && client_hello.caps.hybrid;
-    // Hybrid mode piggybacks the classical X25519 secret in addition to Kyber.
     let classical = if use_hybrid {
         Some(
             x_secret
@@ -429,7 +426,6 @@ fn nonce_to_12(n: u64) -> [u8; 12] {
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(mut w: W, nonce: u64, ct: &[u8]) -> Result<()> {
-    // Frame format: len (u32 LE) | nonce (u64 LE) | ciphertext bytes.
     let len: u32 = (8 + ct.len()) as u32;
     w.write_u32_le(len).await?;
     w.write_u64_le(nonce).await?;
