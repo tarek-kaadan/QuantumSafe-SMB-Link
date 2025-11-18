@@ -1,4 +1,3 @@
-// src/main.rs
 mod aead;
 mod kem;
 mod net;
