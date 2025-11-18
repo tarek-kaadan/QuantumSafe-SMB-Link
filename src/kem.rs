@@ -414,18 +414,6 @@ pub fn preauth_hash(transcript: &[u8]) -> [u8; 32] {
     out
 }
 
-pub fn ikm_from_shared(shared: &Shared) -> Result<Vec<u8>> {
-    if shared.classical.is_none() && shared.pq.is_empty() {
-        return Err(anyhow!("missing shared secret material"));
-    }
-    let mut ikm = Vec::with_capacity(shared.classical.map(|_| 32).unwrap_or(0) + shared.pq.len());
-    if let Some(classical) = shared.classical {
-        ikm.extend_from_slice(&classical);
-    }
-    ikm.extend_from_slice(&shared.pq);
-    Ok(ikm)
-}
-
 fn push_tlv_u16_list<I: Iterator<Item = u16>>(out: &mut Vec<u8>, tag: u16, values: I) {
     let mut tmp = Vec::new();
     for value in values {

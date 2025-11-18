@@ -32,5 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 cc = "1"
 
 [[bin]]
-name = "gen-keys"
-path = "src/gen_keys.rs"
+name = "gen-server-keys"
+path = "src/gen_server_keys.rs"
+
+[[bin]]
+name = "gen-client-keys"
+path = "src/gen_client_keys.rs"

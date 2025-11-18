@@ -9,7 +9,6 @@ mod aead;
 mod kem;
 mod net;
 mod sig;
-mod gen_keys;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
