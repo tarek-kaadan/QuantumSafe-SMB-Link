@@ -1,4 +1,3 @@
-// src/aead.rs
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -12,7 +11,6 @@ pub struct SessionKeys {
     pub outgoing: [u8; 32],
     pub incoming: [u8; 32],
 }
-
 impl SessionKeys {
     fn derive(preauth: &[u8], ikm: &[u8]) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(preauth), ikm);
@@ -22,7 +20,6 @@ impl SessionKeys {
         hk.expand(b"incoming v1", &mut incoming).unwrap();
         Self { outgoing, incoming }
     }
-
     pub fn from_shared(
         transcript_salt: &[u8],
         classical: Option<&[u8]>,
@@ -32,7 +29,6 @@ impl SessionKeys {
         if classical.is_none() && post_quantum.is_empty() {
             bail!("missing shared secret material");
         }
-        // concatenate whatever shared secret material we ended up with
         let mut ikm = Vec::with_capacity(classical.map(|c| c.len()).unwrap_or(0) + post_quantum.len());
         if let Some(bytes) = classical {
             ikm.extend_from_slice(bytes);
@@ -44,17 +40,14 @@ impl SessionKeys {
         }
         Ok(keys)
     }
-
     fn swap_directions(&mut self) {
         let outgoing = self.outgoing;
         self.outgoing = self.incoming;
         self.incoming = outgoing;
     }
 }
-
 #[derive(Default, Clone)]
 pub struct NonceTicker(u64);
-
 impl NonceTicker {
     pub fn next(&mut self) -> u64 {
         let n = self.0;
@@ -62,7 +55,6 @@ impl NonceTicker {
         n
     }
 }
-
 pub fn aead_seal(
     key: &[u8; 32],
     nonce12: &[u8; 12],
@@ -82,7 +74,6 @@ pub fn aead_seal(
         )
         .map_err(|_| anyhow!("aead encrypt failed"))
 }
-
 pub fn aead_open(
     key: &[u8; 32],
     nonce12: &[u8; 12],
@@ -106,7 +97,6 @@ pub fn aead_open(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn session_keys_match_between_roles() -> Result<()> {
         let transcript = b"handshake transcript salt";
