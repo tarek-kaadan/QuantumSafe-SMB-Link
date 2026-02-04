@@ -5,7 +5,13 @@ use pqcrypto_dilithium::dilithium2;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 
 fn main() -> anyhow::Result<()> {
-    let out_dir = "certs";
+    let out_dir = if cfg!(target_os = "windows") {
+                            r"C:\QuantumSafeSMB\certs"
+                        } else if cfg!(target_os = "linux") {
+                            "/home/kali/QuantumSafeSMB/certs"
+                        } else {
+                            "certs"
+                        };
     let dir = Path::new(out_dir);
     fs::create_dir_all(dir)?;
     let (pk, sk) = dilithium2::keypair();
